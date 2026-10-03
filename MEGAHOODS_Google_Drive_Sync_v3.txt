@@ -1,0 +1,238 @@
+/**************************************************************
+ * MEGAHOODS / MEGAVENTS - Google Drive & Sheets sync receiver
+ * ------------------------------------------------------------
+ * SETUP (one time, ~10 minutes):
+ * 1. Go to https://script.google.com  ->  New project
+ * 2. Delete the default code, paste THIS ENTIRE file, Save
+ * 3. Change SECRET below to your own private word/phrase
+ * 4. Deploy -> New deployment -> type "Web app"
+ *      Execute as        : Me
+ *      Who has access    : Anyone
+ *    (authorise with your Google account when asked)
+ * 5. Copy the Web app URL (.../exec)
+ * 6. In the MEGAHOODS app: Setup -> Google Drive sync
+ *      paste the URL + the same SECRET -> Test connection
+ * 7. Turn "Auto sync" ON if you want save-and-forget syncing
+ *
+ * WHERE THE DATA GOES (your EXISTING Drive folder & Sheet - nothing new
+ * is created at the top level):
+ *   [Folder] ROOT_FOLDER_ID  ->  your existing Drive folder
+ *       [Folder] Customer Folder/<Customer>/  (quotation .html + .json, Site visits/,
+ *           Installation photos/, Service photos/, Drawings/, Documents/)
+ *   [Sheet] SHEET_ID  ->  your existing Google Sheet
+ *       (tabs: Quotations, Tickets, Photos log, Settings, Payments)
+ **************************************************************/
+
+var SECRET = 'CHANGE-ME-123';          // <- your private key, same as in the app
+var SHEET_ID = '15LN5v_e7Vze5WNRJwzpyJ6h5_WsBCTfZTg8v4DxGq3o';        // <- your Google Sheet
+var ROOT_FOLDER_ID = '14ruARN7tmnCJzJhFkDj_kcELUeax0VOg';             // <- your Drive folder
+var CUST_ROOT = 'Customer Folder';
+
+/* ---------------- entry points ---------------- */
+function doPost(e){
+  try{
+    var body = JSON.parse(e.postData.contents || '{}');
+    if(body.key !== SECRET) return out({ok:false, error:'Wrong key'});
+    var a = body.action, p = body.payload || {};
+    if(a==='ping')          return out(ping());
+    if(a==='quote')         return out(saveQuote(p));
+    if(a==='ticket')        return out(saveTicket(p));
+    if(a==='ticket_delete') return out(delTicket(p));
+    if(a==='photos')        return out(savePhotos(p));
+    if(a==='drawing')       return out(saveDrawing(p));
+    if(a==='pull')          return out(pullAll());
+    if(a==='payment')       return out(savePayment(p));
+    if(a==='payment_delete')return out(delPayment(p));
+    if(a==='passkey')       return out(savePasskey(p));
+    if(a==='folder')        return out(saveFolder(p));
+    return out({ok:false, error:'Unknown action: '+a});
+  }catch(err){
+    return out({ok:false, error:String(err)});
+  }
+}
+function doGet(){ return out({ok:true, msg:'MEGAHOODS sync receiver is alive'}); }
+function out(o){ return ContentService.createTextOutput(JSON.stringify(o)).setMimeType(ContentService.MimeType.JSON); }
+
+/* ---------------- drive / sheet helpers ---------------- */
+function rootFolder(){
+  return DriveApp.getFolderById(ROOT_FOLDER_ID);   // always YOUR existing folder
+}
+function childFolder(parent, name){
+  var it = parent.getFoldersByName(name);
+  return it.hasNext() ? it.next() : parent.createFolder(name);
+}
+function custRoot(){ return childFolder(rootFolder(), CUST_ROOT); }
+function companyFolder(name){
+  return childFolder(custRoot(), name || 'Unnamed customer');
+}
+function registerSheet(tab, headers){
+  var ss = SpreadsheetApp.openById(SHEET_ID);      // always YOUR existing sheet
+  var sh = ss.getSheetByName(tab) || ss.insertSheet(tab);
+  if(sh.getLastRow()===0){ sh.appendRow(headers); sh.setFrozenRows(1); sh.getRange(1,1,1,headers.length).setFontWeight('bold'); }
+  return { ss:ss, sh:sh };
+}
+function saveBlob(folder, name, dataUrl){
+  if(!dataUrl || dataUrl.indexOf(',')<0) return null;
+  var parts = dataUrl.split(',');
+  var mime = (parts[0].match(/data:(.*?);/)||[])[1] || 'application/octet-stream';
+  var blob = Utilities.newBlob(Utilities.base64Decode(parts[1]), mime, name);
+  // replace an older file with the same name
+  var old = folder.getFilesByName(name);
+  while(old.hasNext()) old.next().setTrashed(true);
+  return folder.createFile(blob);
+}
+
+/* ---------------- actions ---------------- */
+function ping(){
+  var q = registerSheet('Quotations', QHEAD);
+  registerSheet('Tickets', THEAD);
+  registerSheet('Photos log', PHEAD);
+  registerSheet('Settings', SHEAD);
+  registerSheet('Payments', PAYHEAD);
+  return { ok:true, sheet:q.ss.getUrl(), root:rootFolder().getUrl() };
+}
+
+var PAYHEAD = ['Payment ID','Quote No','Rev','Company','Project','Date','Amount','Mode','UTR / Ref','Note','Order Value','Updated'];
+function savePayment(p){
+  var q = registerSheet('Payments', PAYHEAD);
+  var row = [p.id, p.quoteNo, p.rev||0, p.company||'', p.project||'', p.date||'', p.amount||0,
+             p.mode||'', p.utr||'', p.note||'', p.grand||0, new Date()];
+  upsert(q.sh, row, function(r){ return r[0]===p.id; });
+  return { ok:true, sheet:q.ss.getUrl() };
+}
+function delPayment(p){
+  var q = registerSheet('Payments', PAYHEAD);
+  var vals = q.sh.getDataRange().getValues();
+  for(var i=vals.length-1;i>=1;i--) if(vals[i][0]===p.id) q.sh.deleteRow(i+1);
+  return { ok:true };
+}
+function readPayments(){
+  var q = registerSheet('Payments', PAYHEAD);
+  var vals = q.sh.getDataRange().getValues(), out = [];
+  for(var i=1;i<vals.length;i++){
+    out.push({ id:vals[i][0], quoteNo:vals[i][1], rev:Number(vals[i][2]||0), company:vals[i][3], project:vals[i][4],
+               date:vals[i][5], amount:Number(vals[i][6]||0), mode:vals[i][7], utr:vals[i][8], note:vals[i][9],
+               grand:Number(vals[i][10]||0), updated:String(vals[i][11]||'') });
+  }
+  return out;
+}
+
+var QHEAD = ['Date','Quote No','Rev','Company','Contact','Phone','Email','GSTIN','Site','Status',
+             'Coordinator','Net','GST','Total','Start','End','Commissioned','Equipment - blowers',
+             'Equipment - hoods','Equipment - filters','Items','Warranty','Past install','Folder','Updated'];
+function saveQuote(p){
+  var folder = companyFolder(p.company);
+  var fn = (p.quoteNo||'quote').replace(/\//g,'-') + (p.rev?'_REV'+p.rev:'');
+  var f = saveBlob(folder, fn+'.html', 'data:text/html;base64,'+Utilities.base64Encode(p.html||''));
+  if(p.record) saveBlob(folder, fn+'.json', 'data:application/json;base64,'+Utilities.base64Encode(JSON.stringify(p.record)));
+
+  (p.photos||[]).forEach(function(ph){ saveBlob(childFolder(folder,'Site visits'), ph.name, ph.data); });
+  (p.installPhotos||[]).forEach(function(ph){ saveBlob(childFolder(folder,'Installation photos'), ph.name, ph.data); });
+  (p.docs||[]).forEach(function(d){ saveBlob(childFolder(folder,'Documents'), (d.tag?d.tag+' - ':'')+d.name, d.data); });
+
+  var q = registerSheet('Quotations', QHEAD);
+  var warr = (p.warranty||[]).map(function(w){ return w.cat+' '+w.months+'m (till '+w.till+')'; }).join(' | ');
+  var row = [p.date, p.quoteNo, p.rev||0, p.company, p.contact, p.phone, p.email, p.gst, p.site, p.status,
+             p.coordinator, p.net, p.gstAmt, p.total, p.start, p.end, p.commissioned,
+             p.equipBlowers, p.equipHoods, p.equipFilters, (p.items||[]).length, warr,
+             p.past ? ('Yes - '+(p.installDate||'')) : '', folder.getUrl(), new Date()];
+  upsert(q.sh, row, function(r){ return r[1]===p.quoteNo && Number(r[2])===Number(p.rev||0); });
+  logPhotos(p.company, p.quoteNo, (p.photos||[]).length, (p.installPhotos||[]).length, (p.docs||[]).length);
+  return { ok:true, folder:folder.getUrl(), sheet:q.ss.getUrl(), pdf:'' };
+}
+
+var THEAD = ['Ticket','Created','Company','Site','Contact','Phone','Category','Issue','Priority',
+             'Technician','Scheduled','Status','Resolution','Next due','Closed','Photos','Full JSON','Updated'];
+function saveTicket(t){
+  var q = registerSheet('Tickets', THEAD);
+  var folder = companyFolder(t.company);
+  (t.photos||[]).forEach(function(ph){ saveBlob(childFolder(folder,'Service photos'), ph.name, ph.data); });
+  var row = [t.no, t.created, t.company, t.site, t.contact, t.phone, t.cat, t.issue, t.priority,
+             t.tech, t.sched, t.status, t.resolution, t.nextDue, t.closed,
+             t.photoCount||0, JSON.stringify(t.full||t), new Date()];
+  upsert(q.sh, row, function(r){ return r[0]===t.no; });
+  return { ok:true, sheet:q.ss.getUrl() };
+}
+function delTicket(p){
+  var q = registerSheet('Tickets', THEAD);
+  var vals = q.sh.getDataRange().getValues();
+  for(var i=vals.length-1;i>=1;i--) if(vals[i][0]===p.no) q.sh.deleteRow(i+1);
+  return { ok:true };
+}
+
+function savePhotos(p){   // installation photos pushed after install
+  var folder = companyFolder(p.company);
+  var sub = p.kind==='installation' ? 'Installation photos' : 'Photos';
+  (p.photos||[]).forEach(function(ph){ saveBlob(childFolder(folder,sub), ph.name, ph.data); });
+  logPhotos(p.company, p.quoteNo, 0, (p.photos||[]).length, 0);
+  return { ok:true, folder:folder.getUrl() };
+}
+
+var CAT_LABEL = { civil:'Civil layout', kitchen:'Kitchen layout', electrical:'Electrical layout',
+                  plumbing:'Plumbing layout', mep:'Other MEP drawings', manufacturing:'Manufacturing drawings' };
+function saveDrawing(p){
+  var folder = companyFolder(p.company);
+  var df = childFolder(childFolder(folder,'Drawings'), CAT_LABEL[p.cat]||'Other');
+  saveBlob(df, p.name, p.data);
+  return { ok:true, folder:df.getUrl() };
+}
+
+var PHEAD = ['When','Company','Quote / ref','Visit photos','Installation photos','Documents'];
+function logPhotos(company, ref, vp, ip, dc){
+  var q = registerSheet('Photos log', PHEAD);
+  q.sh.appendRow([new Date(), company, ref, vp, ip, dc]);
+}
+
+function pullAll(){
+  var outR = [], outT = [], outF = [];
+  var rf = custRoot(), folders = rf.getFolders();
+  while(folders.hasNext()){
+    var fo = folders.next(), files = fo.getFiles();
+    while(files.hasNext()){
+      var fi = files.next();
+      if(/_folder\.json$/i.test(fi.getName())){
+        try{ outF.push(JSON.parse(fi.getBlob().getDataAsString())); }catch(e){}
+      } else if(/\.json$/i.test(fi.getName())){
+        try{ outR.push(JSON.parse(fi.getBlob().getDataAsString())); }catch(e){}
+      }
+    }
+  }
+  var q = registerSheet('Tickets', THEAD);
+  var vals = q.sh.getDataRange().getValues();
+  for(var i=1;i<vals.length;i++){
+    try{ outT.push(JSON.parse(vals[i][16])); }catch(e){}
+  }
+  return { ok:true, records:outR, tickets:outT, settings:readSettings(), folders:outF, payments:readPayments() };
+}
+
+function saveFolder(f){
+  var folder = companyFolder(f.company);
+  saveBlob(folder, '_folder.json', 'data:application/json;base64,'+Utilities.base64Encode(JSON.stringify(f)));
+  return { ok:true, folder:folder.getUrl() };
+}
+
+var SHEAD = ['Key','Value','Extra','Updated'];
+function savePasskey(p){
+  var q = registerSheet('Settings', SHEAD);
+  upsert(q.sh, ['passkey', p.hash||'', (p.on===false?'off':'on'), p.updated||new Date().toISOString()],
+         function(r){ return r[0]==='passkey'; });
+  return { ok:true };
+}
+function readSettings(){
+  var q = registerSheet('Settings', SHEAD);
+  var vals = q.sh.getDataRange().getValues();
+  var s = {};
+  for(var i=1;i<vals.length;i++){
+    if(vals[i][0]==='passkey') s.passkey = { hash:vals[i][1], on:vals[i][2]!=='off', updated:String(vals[i][3]||'') };
+  }
+  return s;
+}
+
+/* ---------------- util ---------------- */
+function upsert(sh, row, match){
+  var vals = sh.getDataRange().getValues();
+  for(var i=1;i<vals.length;i++){
+    if(match(vals[i])){ sh.getRange(i+1,1,1,row.length).setValues([row]); return; }
+  }
+  sh.appendRow(row);
+}
